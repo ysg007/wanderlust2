@@ -1,0 +1,10 @@
+{
+  "name": "Wanderlust AI",
+  "description": "An intent-based AI travel guide that plans, adapts, and supports your trips with real-time guidance.",
+  "requestFramePermissions": [
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
