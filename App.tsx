@@ -37,12 +37,25 @@ const App: React.FC = () => {
     setView('onboarding');
   };
 
-  // Restore session on mount
+  // Restore only a server-verified session
   React.useEffect(() => {
-    try {
-      const saved = localStorage.getItem('wanderlust_session');
-      if (saved) { const u = JSON.parse(saved); if (u?.id && u?.email) setUser(u); }
-    } catch {}
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const { getCurrentUser } = await import('./services/authService');
+        const u = await getCurrentUser();
+        if (!cancelled && u?.id && u?.email) {
+          setUser(u);
+        }
+      } catch {
+        if (!cancelled) setUser(null);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const handleLogout = () => {
