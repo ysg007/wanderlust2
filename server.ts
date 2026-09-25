@@ -167,7 +167,7 @@ async function generateContentWithTieredFallback(
   throw lastError;
 }
 
-async function startServer() {
+export async function startServer() {
   const app = express();
   const PORT = 3000;
 
@@ -677,28 +677,39 @@ async function startServer() {
     }
   });
 
-  // Vite Integration
-  if (process.env.NODE_ENV !== "production") {
-    console.log("Serving development Vite assets...");
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: "spa",
-    });
-    app.use(vite.middlewares);
-  } else {
-    console.log("Serving built static production assets.");
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+  // Local Vite/static serving.
+  // On Vercel, the Express app is exported through api/index.ts.
+  if (!process.env.VERCEL) {
+    if (process.env.NODE_ENV !== "production") {
+      console.log("Serving development Vite assets...");
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: "spa",
+      });
+      app.use(vite.middlewares);
+    } else {
+      console.log("Serving built static production assets.");
+      const distPath = path.join(process.cwd(), "dist");
+      app.use(express.static(distPath));
+
+      // Express 5 compatible catch-all route
+      app.get(/.*/, (req, res) => {
+        res.sendFile(path.join(distPath, "index.html"));
+      });
+    }
+
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(
+        `Express custom server running at http://0.0.0.0:${PORT}`
+      );
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Express custom server running at http://0.0.0.0:${PORT}`);
-  });
+  return app;
 }
 
-startServer().catch((e) => {
-  console.log(`[FATAL] Server Crash on Startup: ${e.message || e}`);
-});
+if (!process.env.VERCEL) {
+  startServer().catch((e) => {
+    console.log(`[FATAL] Server Crash on Startup: ${e.message || e}`);
+  });
+}
