@@ -1,3 +1,11 @@
+import { createClient } from '@supabase/supabase-js';
+import nodemailer from 'nodemailer';
+import cookieParser from 'cookie-parser';
+import crypto from 'crypto';
+import ws from "ws";
+
+(globalThis as any).WebSocket = ws;
+
 import express from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
@@ -173,6 +181,350 @@ export async function startServer() {
 
   // Middleware
   app.use(express.json({ limit: '10mb' }));
+  app.use(cookieParser());
+
+  // ===== Wanderlust AI authentication backend =====
+  const supabaseAdmin = createClient(
+    process.env.SUPABASE_URL || "",
+    process.env.SUPABASE_SERVICE_ROLE_KEY || ""
+  );
+
+  const SESSION_DAYS = 30;
+  const VERIFICATION_HOURS = 24;
+  const RESET_HOURS = 1;
+
+  const hashToken = (token: string) =>
+    crypto.createHash("sha256").update(token).digest("hex");
+
+  const randomToken = () => crypto.randomBytes(32).toString("hex");
+
+  const hashPassword = (password: string) => {
+    const salt = crypto.randomBytes(16).toString("hex");
+    const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+    return `${salt}:${hash}`;
+  };
+
+  const verifyPassword = (password: string, stored: string) => {
+    const [salt, originalHash] = stored.split(":");
+    if (!salt || !originalHash) return false;
+
+    const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+
+    return crypto.timingSafeEqual(
+      Buffer.from(hash, "hex"),
+      Buffer.from(originalHash, "hex")
+    );
+  };
+
+  const emailTransporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: process.env.SMTP_SECURE === "true",
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS,
+    },
+  });
+
+  const setSessionCookie = (res: any, token: string) => {
+    res.cookie("wanderlust_session", token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      maxAge: SESSION_DAYS * 24 * 60 * 60 * 1000,
+      path: "/",
+    });
+  };
+
+  const getSessionUser = async (req: any) => {
+    const token = req.cookies?.wanderlust_session;
+    if (!token) return null;
+
+    const tokenHash = hashToken(token);
+
+    const { data: session } = await supabaseAdmin
+      .from("sessions")
+      .select("user_id, expires_at")
+      .eq("token_hash", tokenHash)
+      .gt("expires_at", new Date().toISOString())
+      .maybeSingle();
+
+    if (!session) return null;
+
+    const { data: user } = await supabaseAdmin
+      .from("users")
+      .select("id, name, email, email_verified_at")
+      .eq("id", session.user_id)
+      .maybeSingle();
+
+    if (!user || !user.email_verified_at) return null;
+
+    return {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+    };
+  };
+
+  app.post("/api/auth/signup", async (req, res) => {
+    try {
+      const name = String(req.body?.name || "").trim();
+      const email = String(req.body?.email || "").trim().toLowerCase();
+      const password = String(req.body?.password || "");
+
+      if (!name) {
+        return res.status(400).json({ error: "Name is required" });
+      }
+
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ error: "Enter a valid email address" });
+      }
+
+      if (password.length < 8) {
+        return res.status(400).json({
+          error: "Password must be at least 8 characters",
+        });
+      }
+
+      const { data: existing } = await supabaseAdmin
+        .from("users")
+        .select("id, email_verified_at")
+        .eq("email", email)
+        .maybeSingle();
+
+      if (existing) {
+        if (existing.email_verified_at) {
+          return res.status(409).json({
+            error: "An account with this email already exists",
+          });
+        }
+
+        return res.status(409).json({
+          error: "This email is already registered but not verified. Check your email for the verification link.",
+        });
+      }
+
+      const { data: user, error: userError } = await supabaseAdmin
+        .from("users")
+        .insert({
+          name,
+          email,
+          password_hash: hashPassword(password),
+        })
+        .select("id, name, email")
+        .single();
+
+      if (userError || !user) {
+        throw userError || new Error("Could not create account");
+      }
+
+      const token = randomToken();
+
+      await supabaseAdmin.from("email_verification_tokens").insert({
+        user_id: user.id,
+        token_hash: hashToken(token),
+        expires_at: new Date(
+          Date.now() + VERIFICATION_HOURS * 60 * 60 * 1000
+        ).toISOString(),
+      });
+
+      const appUrl = process.env.APP_URL || "http://localhost:5173";
+      const verifyUrl = `${appUrl}/api/auth/verify?token=${encodeURIComponent(token)}`;
+
+      await emailTransporter.sendMail({
+        from: process.env.EMAIL_FROM || process.env.SMTP_USER,
+        to: email,
+        subject: "Verify your Wanderlust AI email",
+        text: `Hi ${name},\n\nPlease verify your email by opening this link:\n${verifyUrl}\n\nThis link expires in 24 hours.`,
+        html: `
+          <h2>Welcome to Wanderlust AI</h2>
+          <p>Hi ${name},</p>
+          <p>Please verify your email address to activate your account.</p>
+          <p><a href="${verifyUrl}">Verify my email</a></p>
+          <p>This link expires in 24 hours.</p>
+        `,
+      });
+
+      return res.status(201).json({
+        message: "Account created. Please check your email to verify your account.",
+      });
+    } catch (error: any) {
+      console.error("[AUTH SIGNUP]", error);
+      return res.status(500).json({
+        error: "Unable to create account right now",
+      });
+    }
+  });
+
+  app.get("/api/auth/verify", async (req, res) => {
+    try {
+      const token = String(req.query?.token || "");
+      if (!token) {
+        return res.status(400).send("Invalid verification link.");
+      }
+
+      const { data: record } = await supabaseAdmin
+        .from("email_verification_tokens")
+        .select("id, user_id, expires_at")
+        .eq("token_hash", hashToken(token))
+        .gt("expires_at", new Date().toISOString())
+        .maybeSingle();
+
+      if (!record) {
+        return res.status(400).send("This verification link is invalid or expired.");
+      }
+
+      await supabaseAdmin
+        .from("users")
+        .update({ email_verified_at: new Date().toISOString() })
+        .eq("id", record.user_id);
+
+      await supabaseAdmin
+        .from("email_verification_tokens")
+        .delete()
+        .eq("id", record.id);
+
+      const appUrl = process.env.APP_URL || "http://localhost:5173";
+      return res.redirect(`${appUrl}/?verified=1`);
+    } catch (error) {
+      console.error("[AUTH VERIFY]", error);
+      return res.status(500).send("Email verification failed.");
+    }
+  });
+
+  app.post("/api/auth/login", async (req, res) => {
+    try {
+      const email = String(req.body?.email || "").trim().toLowerCase();
+      const password = String(req.body?.password || "");
+
+      const { data: user } = await supabaseAdmin
+        .from("users")
+        .select("id, name, email, password_hash, email_verified_at")
+        .eq("email", email)
+        .maybeSingle();
+
+      if (!user || !verifyPassword(password, user.password_hash)) {
+        return res.status(401).json({ error: "Invalid email or password" });
+      }
+
+      if (!user.email_verified_at) {
+        return res.status(403).json({
+          error: "Please verify your email before signing in.",
+        });
+      }
+
+      const sessionToken = randomToken();
+
+      await supabaseAdmin.from("sessions").insert({
+        user_id: user.id,
+        token_hash: hashToken(sessionToken),
+        expires_at: new Date(
+          Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000
+        ).toISOString(),
+      });
+
+      setSessionCookie(res, sessionToken);
+
+      return res.json({
+        user: {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+        },
+      });
+    } catch (error: any) {
+      console.error("[AUTH LOGIN]", error);
+      return res.status(500).json({
+        error: "Unable to sign in right now",
+      });
+    }
+  });
+
+  app.get("/api/auth/me", async (req, res) => {
+    try {
+      const user = await getSessionUser(req);
+      return res.json({ user });
+    } catch (error) {
+      console.error("[AUTH ME]", error);
+      return res.json({ user: null });
+    }
+  });
+
+  app.post("/api/auth/logout", async (req, res) => {
+    try {
+      const token = req.cookies?.wanderlust_session;
+
+      if (token) {
+        await supabaseAdmin
+          .from("sessions")
+          .delete()
+          .eq("token_hash", hashToken(token));
+      }
+
+      res.clearCookie("wanderlust_session", {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === "production",
+        sameSite: "lax",
+        path: "/",
+      });
+
+      return res.json({ success: true });
+    } catch (error) {
+      console.error("[AUTH LOGOUT]", error);
+      return res.status(500).json({ error: "Unable to log out" });
+    }
+  });
+
+  app.post("/api/auth/forgot-password", async (req, res) => {
+    try {
+      const email = String(req.body?.email || "").trim().toLowerCase();
+
+      const { data: user } = await supabaseAdmin
+        .from("users")
+        .select("id, name, email")
+        .eq("email", email)
+        .maybeSingle();
+
+      if (user) {
+        const token = randomToken();
+
+        await supabaseAdmin.from("password_reset_tokens").insert({
+          user_id: user.id,
+          token_hash: hashToken(token),
+          expires_at: new Date(
+            Date.now() + RESET_HOURS * 60 * 60 * 1000
+          ).toISOString(),
+        });
+
+        const appUrl = process.env.APP_URL || "http://localhost:5173";
+        const resetUrl = `${appUrl}/reset-password?token=${encodeURIComponent(token)}`;
+
+        await emailTransporter.sendMail({
+          from: process.env.EMAIL_FROM || process.env.SMTP_USER,
+          to: email,
+          subject: "Reset your Wanderlust AI password",
+          text: `Reset your password here:\n${resetUrl}\n\nThis link expires in 1 hour.`,
+          html: `
+            <h2>Wanderlust AI password reset</h2>
+            <p>Hi ${user.name},</p>
+            <p><a href="${resetUrl}">Reset my password</a></p>
+            <p>This link expires in 1 hour.</p>
+          `,
+        });
+      }
+
+      return res.json({
+        message: "If an account exists for that email, a password reset link has been sent.",
+      });
+    } catch (error) {
+      console.error("[AUTH FORGOT]", error);
+      return res.status(500).json({
+        error: "Unable to process the request right now",
+      });
+    }
+  });
+  // ===== End authentication backend =====
+
   
   // CORS for development
   app.use((req, res, next) => {

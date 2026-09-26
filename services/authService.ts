@@ -1,47 +1,93 @@
 import { User } from '../types';
 
-// Mock delay to simulate network request
-const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+async function request<T>(
+  url: string,
+  options: RequestInit = {}
+): Promise<T> {
+  const response = await fetch(url, {
+    ...options,
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(options.headers || {}),
+    },
+  });
 
-export const login = async (email: string, password: string): Promise<User> => {
-  await delay(1000); // Simulate API latency
-  
-  // Basic validation simulation
-  if (!email.includes('@')) {
-    throw new Error("Invalid email address");
-  }
-  if (password.length < 6) {
-    throw new Error("Password must be at least 6 characters");
+  let data: any = null;
+
+  try {
+    data = await response.json();
+  } catch {
+    data = null;
   }
 
-  // Simulate success
-  return {
-    id: 'user-' + Date.now(),
-    name: (() => {
-      const raw = email.split('@')[0].replace(/[._\-\d]+/g, ' ').trim();
-      return raw.split(' ').map((w: string) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ') || 'Traveler';
-    })(),
-    email: email
-  };
+  if (!response.ok) {
+    throw new Error(data?.error || 'Something went wrong');
+  }
+
+  return data;
+}
+
+export const login = async (
+  email: string,
+  password: string
+): Promise<User> => {
+  const data = await request<{ user: User }>('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({
+      email: email.trim().toLowerCase(),
+      password,
+    }),
+  });
+
+  return data.user;
 };
 
-export const signup = async (name: string, email: string, password: string): Promise<User> => {
-  await delay(1500);
-  
-  if (!email.includes('@')) throw new Error("Invalid email address");
-  if (!name) throw new Error("Name is required");
-  if (password.length < 6) throw new Error("Password too short");
+export const signup = async (
+  name: string,
+  email: string,
+  password: string
+): Promise<User> => {
+  const data = await request<{ user: User; message?: string }>(
+    '/api/auth/signup',
+    {
+      method: 'POST',
+      body: JSON.stringify({
+        name: name.trim(),
+        email: email.trim().toLowerCase(),
+        password,
+      }),
+    }
+  );
 
-  return {
-    id: 'user-' + Date.now(),
-    name,
-    email
-  };
+  return data.user;
 };
 
-export const forgotPassword = async (email: string): Promise<void> => {
-  await delay(1000);
-  if (!email.includes('@')) throw new Error("Invalid email address");
-  // In a real app, this would trigger a backend email
-  return; 
+export const forgotPassword = async (
+  email: string
+): Promise<void> => {
+  await request('/api/auth/forgot-password', {
+    method: 'POST',
+    body: JSON.stringify({
+      email: email.trim().toLowerCase(),
+    }),
+  });
+};
+
+export const getCurrentUser = async (): Promise<User | null> => {
+  try {
+    const data = await request<{ user: User | null }>(
+      '/api/auth/me'
+    );
+
+    return data.user || null;
+  } catch {
+    return null;
+  }
+};
+
+export const logout = async (): Promise<void> => {
+  await request('/api/auth/logout', {
+    method: 'POST',
+  });
 };
