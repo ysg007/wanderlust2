@@ -10,14 +10,10 @@
   ],
   "functions": {
     "api/index.ts": {
-      "includeFiles": [
-        "server.ts"
-      ]
+      "includeFiles": "dist/server.cjs"
     },
     "api/[...path].ts": {
-      "includeFiles": [
-        "server.ts"
-      ]
+      "includeFiles": "dist/server.cjs"
     }
   }
 }

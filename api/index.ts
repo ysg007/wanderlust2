@@ -1,10 +1,11 @@
-import { startServer } from "../server.ts";
-
-let appPromise: ReturnType<typeof startServer> | null = null;
+let appPromise: Promise<any> | null = null;
 
 export default async function handler(req: any, res: any) {
   if (!appPromise) {
-    appPromise = startServer();
+    appPromise = (async () => {
+      const { startServer } = await import("../dist/server.cjs");
+      return startServer();
+    })();
   }
 
   const app = await appPromise;
